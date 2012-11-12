@@ -1,0 +1,18 @@
+
+# enable_service n-vol
+ENABLED_SERVICES=g-api,g-reg,key,n-api,n-crt,n-obj,n-cpu,n-net,cinder,c-sch,c-api,c-vol,n-sch,n-novnc,n-xvnc,n-cauth,horizon,mysql,rabbit,quantum,q-svc,q-agt
+# Networks
+# HOST_IP=192.168.x.x
+
+Q_PLUGIN=rgos
+
+VLAN_INTERFACE=eth0
+FIXED_NETWORK_SIZE=256
+FIXED_RANGE=10.0.1.0/24                                                                                                                      
+MULTI_HOST=1
+LOGFILE=/opt/stack/logs/stack.sh.log
+MYSQL_PASSWORD=xxxx
+RABBIT_PASSWORD=xxxx
+SERVICE_TOKEN=xxxx
+SERVICE_PASSWORD=xxxx
+ADMIN_PASSWORD=xxxx

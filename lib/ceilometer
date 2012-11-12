@@ -1,0 +1,90 @@
+# lib/ceilometer
+# Install and start Ceilometer service
+# To enable, add the following to localrc
+# ENABLED_SERVICES+=ceilometer-acompute,ceilometer-acentral,ceilometer-collector,ceilometer-api
+
+
+# Dependencies:
+# - functions
+# - OS_USERNAME, OS_PASSWORD, OS_TENANT_NAME, OS_AUTH_URL set for admin credentials
+# - DEST set to the destination directory
+
+# stack.sh
+# ---------
+# install_XXX
+# configure_XXX
+# init_XXX
+# start_XXX
+# stop_XXX
+# cleanup_XXX
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+set +o xtrace
+
+
+# Defaults
+# --------
+
+# set up default directories
+CEILOMETER_DIR=$DEST/ceilometer
+# Support potential entry-points console scripts
+if [ -d $CEILOMETER_DIR/bin ] ; then
+    CEILOMETER_BIN_DIR=$CEILOMETER_DIR/bin
+else
+    CEILOMETER_BIN_DIR=/usr/local/bin
+fi
+CEILOMETER_CONF_DIR=/etc/ceilometer
+CEILOMETER_CONF=$CEILOMETER_CONF_DIR/ceilometer.conf
+CEILOMETER_API_LOG_DIR=/var/log/ceilometer-api
+
+# cleanup_ceilometer() - Remove residual data files, anything left over from previous
+# runs that a clean run would need to clean up
+function cleanup_ceilometer() {
+    mongo ceilometer --eval "db.dropDatabase();"
+}
+
+# configure_ceilometer() - Set config files, create data dirs, etc
+function configure_ceilometer() {
+    setup_develop $CEILOMETER_DIR
+
+    [ ! -d $CEILOMETER_CONF_DIR ] && sudo mkdir -m 755 -p $CEILOMETER_CONF_DIR
+    sudo chown $USER $CEILOMETER_CONF_DIR
+
+    [ ! -d $CEILOMETER_API_LOG_DIR ] &&  sudo mkdir -m 755 -p $CEILOMETER_API_LOG_DIR
+    sudo chown $USER $CEILOMETER_API_LOG_DIR
+
+    iniset $CEILOMETER_CONF DEFAULT rpc_backend 'ceilometer.openstack.common.rpc.impl_kombu'
+    iniset $CEILOMETER_CONF DEFAULT notification_topics 'notifications,glance_notifications'
+    iniset $CEILOMETER_CONF DEFAULT verbose True
+    iniset $CEILOMETER_CONF DEFAULT rabbit_host $RABBIT_HOST
+    iniset $CEILOMETER_CONF DEFAULT rabbit_password $RABBIT_PASSWORD
+    iniset $CEILOMETER_CONF DEFAULT sql_connection $BASE_SQL_CONN/nova?charset=utf8
+
+    iniset $CEILOMETER_CONF keystone_authtoken auth_protocol http
+    cleanup_ceilometer
+}
+
+# install_ceilometer() - Collect source and prepare
+function install_ceilometer() {
+    git_clone $CEILOMETER_REPO $CEILOMETER_DIR $CEILOMETER_BRANCH
+}
+
+# start_ceilometer() - Start running processes, including screen
+function start_ceilometer() {
+    screen_it ceilometer-acompute "cd $CEILOMETER_DIR && sg libvirtd \"$CEILOMETER_BIN_DIR/ceilometer-agent-compute --config-file $CEILOMETER_CONF\""
+    screen_it ceilometer-acentral "export OS_USERNAME=$OS_USERNAME OS_PASSWORD=$OS_PASSWORD OS_TENANT_NAME=$OS_TENANT_NAME OS_AUTH_URL=$OS_AUTH_URL && cd $CEILOMETER_DIR && $CEILOMETER_BIN_DIR/ceilometer-agent-central --config-file $CEILOMETER_CONF"
+    screen_it ceilometer-collector "cd $CEILOMETER_DIR && $CEILOMETER_BIN_DIR/ceilometer-collector --config-file $CEILOMETER_CONF"
+    screen_it ceilometer-api "cd $CEILOMETER_DIR && $CEILOMETER_BIN_DIR/ceilometer-api -d -v --log-dir=$CEILOMETER_API_LOG_DIR --config-file $CEILOMETER_CONF"
+}
+
+# stop_ceilometer() - Stop running processes
+function stop_ceilometer() {
+    # Kill the ceilometer screen windows
+    for serv in ceilometer-acompute ceilometer-acentral ceilometer-collector ceilometer-api; do
+        screen -S $SCREEN_NAME -p $serv -X kill
+    done
+}
+
+# Restore xtrace
+$XTRACE

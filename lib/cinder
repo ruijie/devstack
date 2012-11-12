@@ -1,0 +1,241 @@
+# lib/cinder
+# Install and start Cinder volume service
+
+# Dependencies:
+# - functions
+# - DEST, DATA_DIR must be defined
+# - KEYSTONE_AUTH_* must be defined
+# SERVICE_{TENANT_NAME|PASSWORD} must be defined
+
+# stack.sh
+# ---------
+# install_XXX
+# configure_XXX
+# init_XXX
+# start_XXX
+# stop_XXX
+# cleanup_XXX
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+set +o xtrace
+
+
+# Defaults
+# --------
+
+# set up default directories
+CINDER_DIR=$DEST/cinder
+CINDERCLIENT_DIR=$DEST/python-cinderclient
+CINDER_STATE_PATH=${CINDER_STATE_PATH:=$DATA_DIR/cinder}
+CINDER_CONF_DIR=/etc/cinder
+CINDER_CONF=$CINDER_CONF_DIR/cinder.conf
+
+# Support entry points installation of console scripts
+if [[ -d $CINDER_DIR/bin ]]; then
+    CINDER_BIN_DIR=$CINDER_DIR/bin
+else
+    CINDER_BIN_DIR=/usr/local/bin
+fi
+
+# Name of the lvm volume group to use/create for iscsi volumes
+VOLUME_GROUP=${VOLUME_GROUP:-stack-volumes}
+VOLUME_NAME_PREFIX=${VOLUME_NAME_PREFIX:-volume-}
+
+# cleanup_cinder() - Remove residual data files, anything left over from previous
+# runs that a clean run would need to clean up
+function cleanup_cinder() {
+    # This function intentionally left blank
+    :
+}
+
+# configure_cinder() - Set config files, create data dirs, etc
+function configure_cinder() {
+    setup_develop $CINDER_DIR
+    setup_develop $CINDERCLIENT_DIR
+
+    if [[ ! -d $CINDER_CONF_DIR ]]; then
+        sudo mkdir -p $CINDER_CONF_DIR
+    fi
+    sudo chown `whoami` $CINDER_CONF_DIR
+
+    cp -p $CINDER_DIR/etc/cinder/policy.json $CINDER_CONF_DIR
+
+    # Set the paths of certain binaries
+    if [[ "$os_PACKAGE" = "deb" ]]; then
+        CINDER_ROOTWRAP=/usr/local/bin/cinder-rootwrap
+    else
+        CINDER_ROOTWRAP=/usr/bin/cinder-rootwrap
+    fi
+
+    # If Cinder ships the new rootwrap filters files, deploy them
+    # (owned by root) and add a parameter to $CINDER_ROOTWRAP
+    ROOTWRAP_CINDER_SUDOER_CMD="$CINDER_ROOTWRAP"
+    if [[ -d $CINDER_DIR/etc/cinder/rootwrap.d ]]; then
+        # Wipe any existing rootwrap.d files first
+        if [[ -d $CINDER_CONF_DIR/rootwrap.d ]]; then
+            sudo rm -rf $CINDER_CONF_DIR/rootwrap.d
+        fi
+        # Deploy filters to /etc/cinder/rootwrap.d
+        sudo mkdir -m 755 $CINDER_CONF_DIR/rootwrap.d
+        sudo cp $CINDER_DIR/etc/cinder/rootwrap.d/*.filters $CINDER_CONF_DIR/rootwrap.d
+        sudo chown -R root:root $CINDER_CONF_DIR/rootwrap.d
+        sudo chmod 644 $CINDER_CONF_DIR/rootwrap.d/*
+        # Set up rootwrap.conf, pointing to /etc/cinder/rootwrap.d
+        sudo cp $CINDER_DIR/etc/cinder/rootwrap.conf $CINDER_CONF_DIR/
+        sudo sed -e "s:^filters_path=.*$:filters_path=$CINDER_CONF_DIR/rootwrap.d:" -i $CINDER_CONF_DIR/rootwrap.conf
+        sudo chown root:root $CINDER_CONF_DIR/rootwrap.conf
+        sudo chmod 0644 $CINDER_CONF_DIR/rootwrap.conf
+        # Specify rootwrap.conf as first parameter to cinder-rootwrap
+        CINDER_ROOTWRAP="$CINDER_ROOTWRAP $CINDER_CONF_DIR/rootwrap.conf"
+        ROOTWRAP_CINDER_SUDOER_CMD="$CINDER_ROOTWRAP *"
+    fi
+
+    TEMPFILE=`mktemp`
+    echo "$USER ALL=(root) NOPASSWD: $ROOTWRAP_CINDER_SUDOER_CMD" >$TEMPFILE
+    chmod 0440 $TEMPFILE
+    sudo chown root:root $TEMPFILE
+    sudo mv $TEMPFILE /etc/sudoers.d/cinder-rootwrap
+
+    CINDER_API_PASTE_INI=$CINDER_CONF_DIR/api-paste.ini
+    cp $CINDER_DIR/etc/cinder/api-paste.ini $CINDER_API_PASTE_INI
+    iniset $CINDER_API_PASTE_INI filter:authtoken auth_host $KEYSTONE_AUTH_HOST
+    iniset $CINDER_API_PASTE_INI filter:authtoken auth_port $KEYSTONE_AUTH_PORT
+    iniset $CINDER_API_PASTE_INI filter:authtoken auth_protocol $KEYSTONE_AUTH_PROTOCOL
+    iniset $CINDER_API_PASTE_INI filter:authtoken admin_tenant_name $SERVICE_TENANT_NAME
+    iniset $CINDER_API_PASTE_INI filter:authtoken admin_user cinder
+    iniset $CINDER_API_PASTE_INI filter:authtoken admin_password $SERVICE_PASSWORD
+
+    cp $CINDER_DIR/etc/cinder/cinder.conf.sample $CINDER_CONF
+    iniset $CINDER_CONF DEFAULT auth_strategy keystone
+    iniset $CINDER_CONF DEFAULT verbose True
+    iniset $CINDER_CONF DEFAULT volume_group $VOLUME_GROUP
+    iniset $CINDER_CONF DEFAULT volume_name_template ${VOLUME_NAME_PREFIX}%s
+    iniset $CINDER_CONF DEFAULT iscsi_helper tgtadm
+    iniset $CINDER_CONF DEFAULT sql_connection $BASE_SQL_CONN/cinder?charset=utf8
+    iniset $CINDER_CONF DEFAULT api_paste_config $CINDER_API_PASTE_INI
+    iniset $CINDER_CONF DEFAULT root_helper "sudo ${CINDER_ROOTWRAP}"
+    iniset $CINDER_CONF DEFAULT osapi_volume_extension cinder.api.openstack.volume.contrib.standard_extensions
+    iniset $CINDER_CONF DEFAULT state_path $CINDER_STATE_PATH
+
+    if is_service_enabled qpid ; then
+        iniset $CINDER_CONF DEFAULT rpc_backend cinder.openstack.common.rpc.impl_qpid
+    elif is_service_enabled zeromq; then
+        iniset $CINDER_CONF DEFAULT rpc_backend nova.openstack.common.rpc.impl_zmq
+    elif [ -n "$RABBIT_HOST" ] &&  [ -n "$RABBIT_PASSWORD" ]; then
+        iniset $CINDER_CONF DEFAULT rabbit_host $RABBIT_HOST
+        iniset $CINDER_CONF DEFAULT rabbit_password $RABBIT_PASSWORD
+    fi
+
+    if [ "$LOG_COLOR" == "True" ] && [ "$SYSLOG" == "False" ]; then
+        # Add color to logging output
+        iniset $CINDER_CONF DEFAULT logging_context_format_string "%(asctime)s %(color)s%(levelname)s %(name)s [[01;36m%(request_id)s [00;36m%(user_id)s %(project_id)s%(color)s] [01;35m%(instance)s%(color)s%(message)s[00m"
+        iniset $CINDER_CONF DEFAULT logging_default_format_string "%(asctime)s %(color)s%(levelname)s %(name)s [[00;36m-%(color)s] [01;35m%(instance)s%(color)s%(message)s[00m"
+        iniset $CINDER_CONF DEFAULT logging_debug_format_suffix "[00;33mfrom (pid=%(process)d) %(funcName)s %(pathname)s:%(lineno)d[00m"
+        iniset $CINDER_CONF DEFAULT logging_exception_prefix "%(color)s%(asctime)s TRACE %(name)s [01;35m%(instance)s[00m"
+    fi
+}
+
+# init_cinder() - Initialize database and volume group
+function init_cinder() {
+    # Force nova volumes off
+    NOVA_ENABLED_APIS=$(echo $NOVA_ENABLED_APIS | sed "s/osapi_volume,//")
+
+    if is_service_enabled mysql; then
+        # (re)create cinder database
+        mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -e 'DROP DATABASE IF EXISTS cinder;'
+        mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -e 'CREATE DATABASE cinder;'
+
+        # (re)create cinder database
+        $CINDER_BIN_DIR/cinder-manage db sync
+    fi
+
+    if is_service_enabled c-vol; then
+        # Configure a default volume group called '`stack-volumes`' for the volume
+        # service if it does not yet exist.  If you don't wish to use a file backed
+        # volume group, create your own volume group called ``stack-volumes`` before
+        # invoking ``stack.sh``.
+        #
+        # By default, the backing file is 5G in size, and is stored in ``/opt/stack/data``.
+
+        if ! sudo vgs $VOLUME_GROUP; then
+            VOLUME_BACKING_FILE=${VOLUME_BACKING_FILE:-$DATA_DIR/${VOLUME_GROUP}-backing-file}
+            # Only create if the file doesn't already exists
+            [[ -f $VOLUME_BACKING_FILE ]] || truncate -s $VOLUME_BACKING_FILE_SIZE $VOLUME_BACKING_FILE
+            DEV=`sudo losetup -f --show $VOLUME_BACKING_FILE`
+            # Only create if the loopback device doesn't contain $VOLUME_GROUP
+            if ! sudo vgs $VOLUME_GROUP; then sudo vgcreate $VOLUME_GROUP $DEV; fi
+        fi
+
+        mkdir -p $CINDER_STATE_PATH/volumes
+
+        if sudo vgs $VOLUME_GROUP; then
+            if [[ "$os_PACKAGE" = "rpm" ]]; then
+                # RPM doesn't start the service
+                start_service tgtd
+            fi
+
+            # Remove iscsi targets
+            sudo tgtadm --op show --mode target | grep $VOLUME_NAME_PREFIX | grep Target | cut -f3 -d ' ' | sudo xargs -n1 tgt-admin --delete || true
+            # Clean out existing volumes
+            for lv in `sudo lvs --noheadings -o lv_name $VOLUME_GROUP`; do
+                # VOLUME_NAME_PREFIX prefixes the LVs we want
+                if [[ "${lv#$VOLUME_NAME_PREFIX}" != "$lv" ]]; then
+                    sudo lvremove -f $VOLUME_GROUP/$lv
+                fi
+            done
+        fi
+    fi
+}
+
+# install_cinder() - Collect source and prepare
+function install_cinder() {
+    git_clone $CINDER_REPO $CINDER_DIR $CINDER_BRANCH
+    git_clone $CINDERCLIENT_REPO $CINDERCLIENT_DIR $CINDERCLIENT_BRANCH
+}
+
+# apply config.d approach (e.g. Oneiric does not have this)
+function _configure_tgt_for_config_d() {
+    if [[ ! -d /etc/tgt/conf.d/ ]]; then
+        sudo mkdir /etc/tgt/conf.d
+        echo "include /etc/tgt/conf.d/*.conf" | sudo tee -a /etc/tgt/targets.conf
+    fi
+}
+
+# start_cinder() - Start running processes, including screen
+function start_cinder() {
+    if is_service_enabled c-vol; then
+        if [[ "$os_PACKAGE" = "deb" ]]; then
+            _configure_tgt_for_config_d
+            if [[ ! -f /etc/tgt/conf.d/cinder.conf ]]; then
+               echo "include $CINDER_STATE_PATH/volumes/*" | sudo tee /etc/tgt/conf.d/cinder.conf
+            fi
+            # tgt in oneiric doesn't restart properly if tgtd isn't running
+            # do it in two steps
+            sudo stop tgt || true
+            sudo start tgt
+        else
+            # bypass redirection to systemctl during restart
+            sudo /sbin/service --skip-redirect tgtd restart
+        fi
+    fi
+
+    screen_it c-api "cd $CINDER_DIR && $CINDER_BIN_DIR/cinder-api --config-file $CINDER_CONF"
+    screen_it c-vol "cd $CINDER_DIR && $CINDER_BIN_DIR/cinder-volume --config-file $CINDER_CONF"
+    screen_it c-sch "cd $CINDER_DIR && $CINDER_BIN_DIR/cinder-scheduler --config-file $CINDER_CONF"
+}
+
+# stop_cinder() - Stop running processes
+function stop_cinder() {
+    # Kill the cinder screen windows
+    for serv in c-api c-sch c-vol; do
+        screen -S $SCREEN_NAME -p $serv -X kill
+    done
+
+    if is_service_enabled c-vol; then
+        stop_service tgt
+    fi
+}
+
+# Restore xtrace
+$XTRACE
