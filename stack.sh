@@ -1191,6 +1191,8 @@ if is_service_enabled quantum; then
     # Example: ``OVS_PHYSICAL_BRIDGE=br-eth1``
     OVS_PHYSICAL_BRIDGE=${OVS_PHYSICAL_BRIDGE:-}
 
+    # Example: OVS_PHYSICAL_NIC=eth1
+    OVS_PHYSICAL_NIC=${OVS_PHYSICAL_NIC:-}
     # With the linuxbridge plugin, if using VLANs for tenant networks,
     # or if using flat or VLAN provider networks, set in localrc to
     # the name of the network interface to use for the physical
@@ -1361,11 +1363,15 @@ if is_service_enabled q-agt; then
         # Setup physical network bridge mappings.  Override
         # ``OVS_VLAN_RANGES`` and ``OVS_BRIDGE_MAPPINGS`` in ``localrc`` for more
         # complex physical network configurations.
-        if [[ "$OVS_BRIDGE_MAPPINGS" = "" ]] && [[ "$PHYSICAL_NETWORK" != "" ]] && [[ "$OVS_PHYSICAL_BRIDGE" != "" ]]; then
+        if [[ "$OVS_BRIDGE_MAPPINGS" = "" ]] && [[ "$PHYSICAL_NETWORK" != "" ]] && [[ "$OVS_PHYSICAL_BRIDGE" != "" ]] && [[ "$OVS_PHYSICAL_NIC" != "" ]]; then
             OVS_BRIDGE_MAPPINGS=$PHYSICAL_NETWORK:$OVS_PHYSICAL_BRIDGE
 
             # Configure bridge manually with physical interface as port for multi-node
             sudo ovs-vsctl --no-wait -- --may-exist add-br $OVS_PHYSICAL_BRIDGE
+
+	    # Add the eth into bridge
+	    sudo ovs-vsctl --no-wait -- --may-exist add-port $OVS_PHYSICAL_BRIDGE $OVS_PHYSICAL_NIC
+
         fi
         if [[ "$OVS_BRIDGE_MAPPINGS" != "" ]]; then
             iniset /$Q_PLUGIN_CONF_FILE OVS bridge_mappings $OVS_BRIDGE_MAPPINGS
